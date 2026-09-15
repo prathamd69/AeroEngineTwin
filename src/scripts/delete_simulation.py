@@ -23,17 +23,19 @@ async def delete_simulation(run_id: str) -> None:
     conn = await asyncpg.connect(dsn=DATABASE_URL)
     try:
         async with conn.transaction():
-            result = await conn.execute("DELETE FROM simulations WHERE run_id = $1;", parsed_run_id)
+            deleted_run = await conn.fetchrow(
+                "DELETE FROM simulation_runs WHERE run_id = $1 RETURNING row_count;",
+                parsed_run_id,
+            )
             await conn.execute("DELETE FROM simulation_runs WHERE run_id = $1;", parsed_run_id)
-        deleted_rows = int(result.split(" ")[-1])
     finally:
         await conn.close()
 
-    if deleted_rows == 0:
+    if deleted_run is None:
         logger.warning(f"No DB rows found for run_id={run_id}. Nothing to archive-delete.")
         return
 
-    logger.info(f"Deleted {deleted_rows} rows from TimescaleDB for run_id={run_id}")
+    logger.info(f"Deleted run_id={run_id} ({deleted_run['row_count']} telemetry rows).")
 
     s3 = boto3.client(
         's3',
