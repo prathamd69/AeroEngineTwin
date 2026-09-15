@@ -14,9 +14,6 @@ logger = configLogger(__file__)
 
 
 async def delete_simulation(run_id: str) -> None:
-    """Deletes a run's DB rows first, then its archived CSV. Same order
-    and logic as the /runs/{run_id} DELETE endpoint, just callable
-    directly from the terminal without going through the API."""
     try:
         parsed_run_id = uuid.UUID(run_id)
     except ValueError:
@@ -25,7 +22,9 @@ async def delete_simulation(run_id: str) -> None:
 
     conn = await asyncpg.connect(dsn=DATABASE_URL)
     try:
-        result = await conn.execute("DELETE FROM simulations WHERE run_id = $1;", parsed_run_id)
+        async with conn.transaction():
+            result = await conn.execute("DELETE FROM simulations WHERE run_id = $1;", parsed_run_id)
+            await conn.execute("DELETE FROM simulation_runs WHERE run_id = $1;", parsed_run_id)
         deleted_rows = int(result.split(" ")[-1])
     finally:
         await conn.close()
@@ -45,8 +44,8 @@ async def delete_simulation(run_id: str) -> None:
         region_name=REGION_NAME
     )
     try:
-        s3.delete_object(Bucket=SIM_BUCKET, Key=f"{run_id}.csv")
-        logger.info(f"Deleted archived object '{run_id}.csv' from bucket '{SIM_BUCKET}'.")
+        s3.delete_object(Bucket=SIM_BUCKET, Key=f"{run_id}.parquet")
+        logger.info(f"Deleted archived object '{run_id}.parquet' from bucket '{SIM_BUCKET}'.")
     except Exception as e:
         logger.error(f"Failed to delete archive for run_id={run_id}: {e}")
 

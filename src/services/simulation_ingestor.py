@@ -3,7 +3,7 @@ from typing import BinaryIO, Union
 import polars as pl
 import asyncpg
 import io
-
+import uuid
 from src.utils import configLogger
 from src.schemas import SIMULATION_SCHEMA
 
@@ -23,12 +23,11 @@ class SimulationIngestor:
     Supports TimescaleDB write (FastAPI ingestion endpoint, new).
     """
 
-    def __init__(self, encoding : str = 'UTF-16'):
+    def __init__(self):
         self.logger = configLogger(self.__class__.__name__)
-        self.encoding = encoding
 
     def _read_and_validate(self, source: Union[Path, BinaryIO]) -> pl.DataFrame:
-        self.logger.debug("Reading CSV and enforcing SIMULATION_SCHEMA...")
+        self.logger.debug("Reading Parquet and enforcing SIMULATION_SCHEMA...")
 
         if isinstance(source, Path):
             raw_bytes = source.read_bytes()
@@ -37,17 +36,17 @@ class SimulationIngestor:
             raw_bytes = source.read()
 
         try:
-            decoded_text = raw_bytes.decode(self.encoding)
-        except UnicodeDecodeError as e:
-            self.logger.error(f"{self.encoding} decode failed: {e}")
-            raise SimulationIngestionError(f"File is not valid {self.encoding}: {e}")
+            df = pl.read_parquet(io.BytesIO(raw_bytes))
+        except Exception as e:
+            self.logger.error(f"Failed to parse Parquet file: {e}")
+            raise SimulationIngestionError(f"File is not valid Parquet data: {e}")
 
-        df = pl.read_csv(
-            io.StringIO(decoded_text),
-            schema_overrides=SIMULATION_SCHEMA,
-            null_values=["NA", "NaN", "null", ""],
-            # no `encoding=` param — the buffer is already str/unicode, nothing left to decode
-        )
+        # Parquet is self-typed but not guaranteed to match SIMULATION_SCHEMA
+        # exactly — cast explicitly, same enforcement read_csv's
+        # schema_overrides used to give us. Raises SchemaError/
+        # ColumnNotFoundError, both already handled by _validate_and_clean.
+        df = df.cast(SIMULATION_SCHEMA)
+
         if df.height == 0:
             self.logger.error("Ingestion failed: Dataframe is empty.")
             raise SimulationIngestionError("The uploaded simulation file is empty.")
@@ -89,16 +88,22 @@ class SimulationIngestor:
             raise SimulationIngestionError(f"Failed to parse telemetry data: {str(e)}")
 
     async def ingest_to_db(
-        self, run_id: str, source: Union[Path, BinaryIO], pool: asyncpg.Pool
+        self, run_id: uuid.UUID, session_name: str, source: Union[Path, BinaryIO], pool: asyncpg.Pool
     ) -> int:
         """
-        FastAPI path — validates/cleans, then bulk-inserts into the
-        `simulations` hypertable via asyncpg. Uses copy_records_to_table,
-        not executemany — meaningfully faster at scale and the fix for
-        the executemany bottleneck flagged earlier for longer runs.
+        Writes both the simulation_runs summary row and the bulk telemetry
+        insert in one transaction. No FK between the tables, so order
+        between the two statements doesn't matter for correctness — kept
+        as summary-row-first purely for readability.
         """
         self.logger.info(f"Starting DB ingestion for run_id={run_id}")
         clean_df = self._validate_and_clean(source)
+
+        row_count = clean_df.height
+        # Already sorted by "t" above, so first/last give min/max directly
+        # without a separate min()/max() pass over the column.
+        t_start = clean_df.select(pl.col("t").first()).item()
+        t_end = clean_df.select(pl.col("t").last()).item()
 
         records = [
             (run_id, row["t"], *[row.get(c) for c in SENSOR_COLUMNS])
@@ -109,11 +114,13 @@ class SimulationIngestor:
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction():
-                    # App-layer dedup, replacing the DB-level UNIQUE constraint
-                    # Timescale rejected on this hypertable (partition column
-                    # must be part of any unique index) — re-ingesting a run
-                    # overwrites rather than duplicating.
-                    await conn.execute("DELETE FROM simulations WHERE run_id = $1;", run_id)
+                    await conn.execute(
+                        """
+                        INSERT INTO simulation_runs (run_id, session_name, row_count, t_start, t_end)
+                        VALUES ($1, $2, $3, $4, $5);
+                        """,
+                        run_id, session_name, row_count, t_start, t_end
+                    )
                     await conn.copy_records_to_table(
                         "simulations", records=records, columns=columns
                     )
@@ -121,5 +128,5 @@ class SimulationIngestor:
             self.logger.exception("Database write failed during ingestion.")
             raise SimulationIngestionError(f"Failed to write telemetry to database: {str(e)}")
 
-        self.logger.info(f"Successfully ingested {len(records)} rows for run_id={run_id}")
-        return len(records)
+        self.logger.info(f"Successfully ingested {row_count} rows for run_id={run_id}")
+        return row_count
