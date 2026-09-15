@@ -153,7 +153,7 @@ async def delete_run(request: Request, run_id: str):
                 "DELETE FROM simulation_runs WHERE run_id = $1 RETURNING row_count;",
                 parsed_run_id,
             )
-            await conn.execute("DELETE FROM simulation WHERE run_id = $1;", parsed_run_id)
+            await conn.execute("DELETE FROM simulations WHERE run_id = $1;", parsed_run_id)
 
     if deleted_run is None:
         raise HTTPException(404, f"No data found for run_id={run_id}")
